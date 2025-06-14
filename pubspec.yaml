@@ -1,0 +1,38 @@
+name: bp2connect
+description: "A new Flutter project."
+
+publish_to: 'none'
+
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.7.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: ^1.10.5
+  get: ^4.7.2
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  path_provider: ^2.1.5
+  fl_chart: ^1.0.0
+  intl: ^0.20.2
+  wifi_iot: ^0.3.19+2
+  cupertino_icons: ^1.0.8
+  permission_handler: ^11.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  build_runner: ^2.4.8           #  ← code generator
+  hive_generator: ^2.0.1
+  flutter_lints: ^3.0.0
+
+flutter:
+
+
+  uses-material-design: true
+
