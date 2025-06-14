@@ -123,7 +123,8 @@ BP2Frame rtWave(int rate) =>
 
 /* ───────── file access (unchanged) ───────── */
 
-BP2Frame getFileList()      => BP2Frame(cmd: 0xF1, pkgType: 0, pkgNo: 0);
+// BP2Frame getFileList()      => BP2Frame(cmd: 0xF1, pkgType: 0, pkgNo: 0);
+
 BP2Frame readFile(int id, int off) =>
     BP2Frame(cmd: 0xF2, pkgType: 0, pkgNo: 0, data: [id, off & 0xFF, off >> 8]);
 
@@ -138,3 +139,27 @@ List<double> decodeEcg(List<int> bytes) {
   }
   return out;
 }
+// ——— mode changes ———
+BP2Frame switchToMemory() =>              // History / “MEMORY” screen
+BP2Frame(cmd: 0x09, pkgType: 0, pkgNo: 0, data: [2]);
+
+// ——— file operations ———
+BP2Frame getFileList() => BP2Frame(cmd: 0xF1);        // unchanged, kept here
+
+BP2Frame readFileStart(String name, int offset) {
+  final d = Uint8List(20)..fillRange(0, 20, 0);
+  final bytes = ascii.encode(name.padRight(16, '\x00'));
+  d.setRange(0, 16, bytes);
+  ByteData.view(d.buffer).setUint32(16, offset, Endian.little);
+  return BP2Frame(cmd: 0xF2, data: d);
+}
+
+BP2Frame readFileData(int offset, int length) {
+  final d = Uint8List(6);
+  ByteData.view(d.buffer)
+    ..setUint32(0, offset, Endian.little)
+    ..setUint16(4, length, Endian.little);
+  return BP2Frame(cmd: 0xF3, data: d);
+}
+
+BP2Frame readFileEnd() => BP2Frame(cmd: 0xF4);

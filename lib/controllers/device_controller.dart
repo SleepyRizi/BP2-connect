@@ -16,6 +16,7 @@ import 'package:get/get.dart';
 import '../models/device_info.dart';
 import '../services/ble_service.dart';
 import '../services/bp2_protocol.dart';
+import 'history_controller.dart';
 
 class DeviceController extends GetxController {
   /* ───────── general ───────── */
@@ -174,10 +175,15 @@ class DeviceController extends GetxController {
   Future<void> stopEcg() async {
     _log('⇢ ECG stop');
     _poll?.cancel();
-    await _send(BP2Frame(cmd: 0x07));
-    _maybePushToUi(force: true);   // ensure last samples reach the screen
+    await _send(BP2Frame(cmd: 0x07));     // close RT wave
+    _maybePushToUi(force: true);          // push final samples to UI
+
+    // Automatically fetch finished run
+    Get.find<HistoryController>().syncLatestEcg();
+
     statusText.value = 'Idle';
   }
+
 
   /* ═════════ dispatch ═════════ */
   void _dispatch(BP2Frame f) {
