@@ -116,7 +116,7 @@ class DeviceController extends GetxController {
 
   /* ═════════ ECG control ═════════ */
   Future<void> startEcg() async {
-    /* UI prep */
+    // UI prep
     statusText.value = 'ECG-Prep';
     diagText.value   = '';
     bpmNow.value     = 0;
@@ -124,23 +124,21 @@ class DeviceController extends GetxController {
     ecg.value = [];
     _t = 0;
     _lastUiPush = 0;
-    _log('⇢ ECG start');
 
-    /* 1 │ switch mode */
+    // 1 │ switch mode
     await _send(switchToEcg());
     await Future.delayed(const Duration(milliseconds: 150));
 
-    /* 2 │ wait RunStatus 6 */
+    // 2 │ wait RunStatus = 6
     var ready = false;
-    late final StreamSubscription waiter;
-    waiter = _ble.frames.listen((f) {
+    late final StreamSubscription sub;
+    sub = _ble.frames.listen((f) {
       if (f.cmd == 0x06 && f.data.isNotEmpty && f.data[0] == 6) {
         ready = true;
         if (f.data.length >= 3) _updBattery(f.data[2]);
-        waiter.cancel();
+        sub.cancel();
       }
     });
-
     final t0 = DateTime.now();
     while (!ready && DateTime.now().difference(t0).inSeconds < 3) {
       await _send(BP2Frame(cmd: 0x06));
@@ -148,41 +146,53 @@ class DeviceController extends GetxController {
     }
     if (!ready) {
       statusText.value = 'ECG-timeout';
-      _log('!! ECG timeout');
       return;
     }
 
-    /* 3 │ open realtime wave */
-    await _send(BP2Frame(cmd: 0x07));
+    // 3 │ open realtime wave + wrapper
+    await _send(rtWave(25));       // 250 Hz
+    await _send(rtWrapper(25));
 
-    /* 4 │ precise poller: wait-for-ack */
+    // 4 │ loss-free poller
     _poll?.cancel();
     _poll = Timer.periodic(const Duration(milliseconds: 40), (_) async {
-      if (_busy) return;            // still waiting for previous reply
+      if (_busy) return;
       _busy = true;
-      await _send(BP2Frame(cmd: 0x08));   // when ack arrives _busy→false
-    });
-
-    /* 5 │ auto-stop after 35 s */
-    Future.delayed(const Duration(seconds: 35), () {
-      if (statusText.value == 'ECG-Measuring') stopEcg();
+      await _send(BP2Frame(cmd: 0x08));
     });
 
     statusText.value = 'ECG-Measuring';
-    _log('⇠ ECG streaming');
   }
 
+  /* ═════════ ECG control ═════════ */
   Future<void> stopEcg() async {
     _log('⇢ ECG stop');
-    _poll?.cancel();
-    await _send(BP2Frame(cmd: 0x07));     // close RT wave
-    _maybePushToUi(force: true);          // push final samples to UI
 
-    // Automatically fetch finished run
-    Get.find<HistoryController>().syncLatestEcg();
+    _poll?.cancel();
+    _busy = true;                       // block any stray poll tick
+
+    // 1) turn off streams
+    await _send(rtWave(0));             // 0x07 00
+    await _send(rtWrapper(0));          // 0x08 00
+
+    _maybePushToUi(force: true);
+
+    // 2) wait until the device sends its *last* 0x08
+    bool quiet = false;
+    late final sub;
+    sub = _ble.frames.listen((f) { if (f.cmd == 0x08) quiet = false; });
+    while (!quiet) {
+      quiet = true;
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+    sub.cancel();
+
+    // 3) hand control to HistoryController
+    Get.find<HistoryController>().syncLatestEcg(userId: 0);
 
     statusText.value = 'Idle';
   }
+
 
 
   /* ═════════ dispatch ═════════ */

@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
 import '../controllers/device_controller.dart';
+import '../controllers/history_controller.dart';
 
 class LivePage extends StatelessWidget {
   const LivePage({super.key});
@@ -39,11 +40,11 @@ class LivePage extends StatelessWidget {
           /* ───── controls (no overflow) ───── */
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Wrap(
+            child:Wrap(
               spacing: 8,
               runSpacing: 4,
-              alignment: WrapAlignment.start,
               children: [
+                // Start ECG, Start BP, Stop …
                 ElevatedButton.icon(
                   icon: const Icon(Icons.favorite),
                   label: const Text('Start ECG'),
@@ -59,6 +60,14 @@ class LivePage extends StatelessWidget {
                   label: const Text('Stop'),
                   onPressed: c.stopEcg,
                 ),
+                /* NEW ↓ */
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.download),
+                  label: const Text('Pull ECG'),
+                  onPressed: () =>
+                      Get.find<HistoryController>().syncLatestEcg(),
+                ),
+                /* existing speed-toggle button */
                 Obx(() => ElevatedButton.icon(
                   icon: const Icon(Icons.speed),
                   label: Text('${c.speedLbl} mm/s'),
@@ -66,6 +75,7 @@ class LivePage extends StatelessWidget {
                 )),
               ],
             ),
+
           ),
           const SizedBox(height: 6),
 

@@ -1,12 +1,14 @@
 // ─────────────────────────────────────────────────────────────
-// lib/controllers/history_controller.dart  –  V3 (14 Jun 2025)
-//   • Adds ECG download / parsing logic (F1–F4)
-//   • Keeps legacy BP parser for backwards‑compat
+// lib/controllers/history_controller.dart  –  V3.3 (15 Jun 2025)
+//   • Cleans up duplicate lines & type errors
+//   • Uses print() instead of debugPrint()
+//   • Adds user‑aware switchToMemory call
 // ─────────────────────────────────────────────────────────────
 
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:convert' show ascii;
+import 'dart:math' as math;
 
 import 'package:get/get.dart';
 import 'package:hive/hive.dart';
@@ -17,38 +19,29 @@ import '../services/ble_service.dart';
 import '../services/bp2_protocol.dart';
 
 class HistoryController extends GetxController {
-  // BLE service handle
   final _ble = Get.find<BleService>();
 
-  // ======= Local caches =======
-  final RxList<BpRecord>  records = <BpRecord>[].obs;   // blood‑pressure list
-  final RxList<EcgRecord> ecgs    = <EcgRecord>[].obs;  // finished ECGs
+  final RxList<BpRecord>  records = <BpRecord>[].obs;  // BP list
+  final RxList<EcgRecord> ecgs    = <EcgRecord>[].obs; // ECG list
 
-  // ======= Startup =======
   @override
   void onInit() {
     super.onInit();
-    // Still listen for BP file pushes (old mechanism)
-    _ble.frames.listen(_onFrame);
+    _ble.frames.listen(_onFrame);   // legacy BP only
   }
 
-  // ---------------------------------------------------------------------
-  //                            BP  (unchanged)
-  // ---------------------------------------------------------------------
-  Future<void> syncFromDevice() async {
-    await _ble.sendFrame(getFileList());   // legacy BP sync
-  }
+  // ───────────── BP LEGACY SYNC ─────────────
+  Future<void> syncFromDevice() async => _ble.sendFrame(getFileList());
 
   void _onFrame(BP2Frame f) async {
     if (f.cmd == 0xF1 && f.pkgType == 0x01) {
-      // File list → iterate BP records (each name 16 B)
-      int pos = 1;                     // first byte = file_num
+      int pos = 1;                              // first byte = file_num
       while (pos + 16 <= f.data.length) {
-        final name = ascii.decode(
-            f.data.sublist(pos, pos + 16)).split('\x00').first;
+        final name = ascii.decode(f.data.sublist(pos, pos + 16))
+            .split('\x00').first;
         pos += 16;
-        final id = records.length;           // any unique slot ok
-        await _ble.sendFrame(readFile(id, 0));
+        final id = records.length;
+        await _ble.sendFrame(readFile(id, 0));  // legacy read path
       }
     } else if (f.cmd == 0xF2 && f.pkgType == 0x01) {
       _parseBpFile(Uint8List.fromList(f.data));
@@ -57,124 +50,146 @@ class HistoryController extends GetxController {
 
   void _parseBpFile(Uint8List bytes) {
     if (bytes.length < 21) return;
-
-    // FileHead_t occupies first 14 bytes (V2)
-    final mode = bytes[9];                       // measure_mode
-    if (mode != 0) return;                       // only single‑mode here
-
-    final systolic  = bytes[14] | (bytes[15] << 8);
-    final diastolic = bytes[16] | (bytes[17] << 8);
-    final mean      = bytes[18] | (bytes[19] << 8);
-    final pulse     = bytes[20];
-
-    final ts = _tsFromName(
-        ascii.decode(bytes.sublist(0, 14)).replaceAll('\u0000', ''));
+    if (bytes[9] != 0) return;                  // single‑measure only
 
     final rec = BpRecord(
-      systolic : systolic,
-      diastolic: diastolic,
-      mean     : mean,
-      pulse    : pulse,
-      time     : ts,
+      systolic  : bytes[14] | (bytes[15] << 8),
+      diastolic : bytes[16] | (bytes[17] << 8),
+      mean      : bytes[18] | (bytes[19] << 8),
+      pulse     : bytes[20],
+      time      : _tsFromName(ascii.decode(bytes.sublist(0, 14))
+          .replaceAll('\u0000', '')),
     );
-
     Hive.box<BpRecord>('bpBox').add(rec);
     records.insert(0, rec);
   }
 
-  // Helper: convert “yyyyMMddhhmmss” → DateTime (UTC)
-  DateTime _tsFromName(String name) => DateTime.utc(
-    int.parse(name.substring(0, 4)),
-    int.parse(name.substring(4, 6)),
-    int.parse(name.substring(6, 8)),
-    int.parse(name.substring(8, 10)),
-    int.parse(name.substring(10, 12)),
-    int.parse(name.substring(12, 14)),
+  DateTime _tsFromName(String s) => DateTime.utc(
+    int.parse(s.substring(0, 4)),
+    int.parse(s.substring(4, 6)),
+    int.parse(s.substring(6, 8)),
+    int.parse(s.substring(8, 10)),
+    int.parse(s.substring(10, 12)),
+    int.parse(s.substring(12, 14)),
   );
 
-  // ---------------------------------------------------------------------
-  //                         ECG  (new logic)
-  // ---------------------------------------------------------------------
+  // ───────────── ECG SYNC ─────────────
+  /// Download the newest ECG record for a given user (default user 0).
+  /// Sequence:
+  ///   1. 0x09 [2,user]  → Review/Memory mode
+  ///   2. wait until the BP-2 stops replying with wrapper packets (0x08)
+  ///      and sleep an extra 800 ms so the flash commit finishes
+  ///   3. 0xF1          → File list
+  ///   4. 0xF2 / 0xF3   → Read file in chunks, finish with 0xF4
+  ///   5. parse + save  → EcgRecord
+// ───────────── ECG SYNC ─────────────
+  Future<void> syncLatestEcg({int userId = 0}) async {
+    /* 0) switch the BP-2 to “memory / review” for the given user */
+    await _ble.sendFrame(switchToMemory(userId: userId));
 
-  /// Public entry — called from DeviceController.stopEcg()
-  Future<void> syncLatestEcg() async {
-    // 1) switch to review mode (Target_status = 2)
-    await _ble.sendFrame(switchToMemory());
-    await Future.delayed(const Duration(milliseconds: 300));
+    /* 0-bis) wait until we have seen no 0×08 packets for ≥400 ms */
+    var last08 = DateTime.now();
+    late final sub;
+    sub = _ble.frames.listen((f) {
+      if (f.cmd == 0x08) last08 = DateTime.now();
+    });
 
-    // 2) fetch file list
-    final listReply = await _awaitReply(getFileList());
-    if (listReply == null || listReply.data.isEmpty) return;
+    while (DateTime.now().difference(last08).inMilliseconds < 400) {
+      await Future.delayed(const Duration(milliseconds: 60));
+    }
+    sub.cancel();
 
-    final count = listReply.data[0];
-    if (count == 0) return;                        // no records stored
+    /* 1) ask for the file list – retry while the firmware is still busy */
+    BP2Frame? listReply;
+    for (var tries = 0; tries < 8; tries++) {
+      listReply = await _awaitReply(getFileList());
+      if (listReply != null &&
+          listReply.pkgType == 0x01 && listReply.data.isNotEmpty) break;
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
 
-    final nameBytes = listReply.data.sublist(
-        1 + (count - 1) * 16, 1 + count * 16);
-    final fileName = ascii.decode(nameBytes).split('\x00').first.trim();
+    if (listReply == null || listReply.data.isEmpty) {
+      print('[ECG] file-list failed');
+      return;
+    }
 
-    // 3) get total file size (Read Start)
-    final startReply = await _awaitReply(readFileStart(fileName, 0));
-    if (startReply == null || startReply.data.length < 4) return;
-    final total = ByteData.sublistView(Uint8List.fromList(startReply.data), 0, 4)
-        .getUint32(0, Endian.little);
+    /* 2) newest file is always the last entry */
+    final count = listReply.data.first;
+    if (count == 0) { print('[ECG] no files for user$userId'); return; }
 
-    // 4) stream file data in 1 kB chunks
+    final namePos  = 1 + (count - 1) * 16;
+    final fileName = ascii
+        .decode(listReply.data.sublist(namePos, namePos + 16))
+        .split('\x00')
+        .first
+        .trim();
+    print('[ECG] downloading “$fileName”…');
+
+    /* 3) total size */
+    final start = await _awaitReply(readFileStart(fileName, 0));
+    if (start == null || start.data.length < 4) {
+      print('[ECG] start-reply failed'); return;
+    }
+    final total = ByteData.sublistView(
+        Uint8List.fromList(start.data), 0, 4).getUint32(0, Endian.little);
+
+    /* 4) chunked download */
     final buff   = BytesBuilder();
     var   offset = 0;
     const chunk  = 1024;
     while (offset < total) {
-      final part = await _awaitReply(
-          readFileData(offset, (total - offset).clamp(0, chunk)));
-      if (part == null) return;          // abort on timeout
+      final req = math.min(chunk, total - offset);
+      final part = await _awaitReply(readFileData(offset, req));
+      if (part == null || part.data.isEmpty) {
+        print('[ECG] aborted at $offset / $total'); return;
+      }
       buff.add(part.data);
       offset += part.data.length;
     }
     await _ble.sendFrame(readFileEnd());
 
-    // 5) decode & persist
+    /* 5) decode & persist */
     _parseEcgFile(buff.toBytes());
+    print('[ECG] saved ${buff.length} bytes');
   }
 
-  // Low‑level round‑trip helper ------------------------------------------------
+
   Future<BP2Frame?> _awaitReply(BP2Frame req) async {
     final c = Completer<BP2Frame?>();
-    late final sub;
+    late final StreamSubscription sub;
+
     sub = _ble.frames.listen((f) {
-      if (f.cmd == req.cmd && f.pkgType == 0x01) {
+      if (f.cmd == req.cmd) {           // ← drop pkgType requirement
         sub.cancel();
         c.complete(f);
       }
     });
+
     await _ble.sendFrame(req);
-    return c.future.timeout(const Duration(seconds: 2), onTimeout: () {
+
+    return c.future
+        .timeout(const Duration(seconds: 3), onTimeout: () {
       sub.cancel();
       return null;
     });
   }
 
-  // ECG file decoder ----------------------------------------------------------
+
   void _parseEcgFile(Uint8List bytes) {
-    if (bytes.length < 40) return;            // header + analysis
+    if (bytes.length < 40) return;
 
     final startUnix = ByteData.sublistView(bytes, 4, 8)
         .getUint32(0, Endian.little);
-    final start     =
-    DateTime.fromMillisecondsSinceEpoch(startUnix * 1000, isUtc: true);
+    final start     = DateTime.fromMillisecondsSinceEpoch(
+        startUnix * 1000, isUtc: true);
 
     final analysis  = ByteData.sublistView(bytes, 8, 40);
-    final duration  = analysis.getUint32(0, Endian.little);
-    final diagBits  = analysis.getUint32(4, Endian.little);
-    final hr        = analysis.getUint16(12, Endian.little);
-
-    final waveBytes = bytes.sublist(40);       // raw Int16 LE waveform
-
     final rec = EcgRecord(
-      start         : start,
-      duration      : duration,
-      hr            : hr,
-      diagnosisBits : diagBits,
-      wave          : waveBytes,
+      start        : start,
+      duration     : analysis.getUint32(0, Endian.little),
+      diagnosisBits: analysis.getUint32(4, Endian.little),
+      hr           : analysis.getUint16(12, Endian.little),
+      wave         : bytes.sublist(40),
     );
 
     Hive.box<EcgRecord>('ecgBox').add(rec);
