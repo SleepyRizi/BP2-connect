@@ -53,9 +53,11 @@ class BleService {
   }
 
   Future<void> sendFrame(BP2Frame f) async {
-    debugPrint('[BP2-TX] ${f.encode().map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+    debugPrint('[BP2-TX] ' +
+        f.encode().map((b) => b.toRadixString(16).padLeft(2, '0')).join(' '));
     await _tx?.write(f.encode(), withoutResponse: true);
   }
+
 
 
   /* ───────── packet assembler ───────── */

@@ -5,6 +5,7 @@ import 'package:permission_handler/permission_handler.dart';       // ← new
 import 'app_binding.dart';
 import 'models/device_info.dart';
 import 'models/bp_record.dart';
+import 'models/ecg_record.dart';
 import 'pages/pairing_page.dart';
 import 'pages/live_page.dart';
 import 'pages/history_page.dart';
@@ -23,8 +24,10 @@ void main() async {
   await Hive.initFlutter();
   Hive.registerAdapter(DeviceInfoAdapter());
   Hive.registerAdapter(BpRecordAdapter());
+  Hive.registerAdapter(EcgRecordAdapter());
   await Hive.openBox<DeviceInfo>('deviceInfoBox');
   await Hive.openBox<BpRecord>('bpBox');
+  await Hive.openBox<EcgRecord>('ecgBox');   // <-- add this
 
   runApp(const BP2App());
 }

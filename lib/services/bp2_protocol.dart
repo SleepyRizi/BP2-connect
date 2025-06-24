@@ -23,7 +23,6 @@ class BP2Frame {
 
   bool get isRaw => cmd == null;
 
-  /* ── encode ── */
   Uint8List encode() {
     if (cmd == null) throw StateError('raw chunk can’t be encoded');
     final bb = BytesBuilder();
@@ -39,11 +38,8 @@ class BP2Frame {
     return bb.toBytes();
   }
 
-  /* ── decode ── */
   static BP2Frame? decode(Uint8List bytes) {
     if (bytes.isEmpty) return null;
-
-    // headered packet
     if (bytes[0] == 0xA5) {
       if (bytes.length < 8) return null;
       if (((~bytes[1]) & 0xFF) != bytes[2]) return null;
@@ -56,13 +52,10 @@ class BP2Frame {
         data    : bytes.sublist(7, 7 + len),
       );
     }
-
-    // raw waveform chunk (must be even length)
     if (bytes.length.isEven) return BP2Frame.raw(bytes);
     return null;
   }
 
-  /* ── CRC-8 (poly 0x07) ── */
   static int _crc8(List<int> b) {
     var crc = 0;
     const poly = 0x07;
@@ -78,12 +71,8 @@ class BP2Frame {
   }
 }
 
-/* ───────── convenience ───────── */
-
 Uint8List _element(String s) =>
     Uint8List.fromList([s.length, ...ascii.encode(s)]);
-
-/* ───────── short requests ───────── */
 
 BP2Frame echo()             => BP2Frame(cmd: 0xE0, data: [0x55]);
 BP2Frame getDeviceInfo()    => BP2Frame(cmd: 0xE1);
@@ -93,53 +82,39 @@ BP2Frame switchToEcg()      => BP2Frame(cmd: 0x09, data: [1]);
 BP2Frame switchToBp()       => BP2Frame(cmd: 0x09, data: [0]);
 BP2Frame startBpTest()      => BP2Frame(cmd: 0x0A, data: [0xAA, 0x00]);
 
-/* ───────── real-time streaming ───────── */
+BP2Frame rtWrapper(int r)   => BP2Frame(cmd: 0x08, data: [r]);
+BP2Frame rtWave   (int r)   => BP2Frame(cmd: 0x07, data: [r]);
 
-BP2Frame rtWrapper(int rate) => BP2Frame(cmd: 0x08, data: [rate]);
-BP2Frame rtWave   (int rate) => BP2Frame(cmd: 0x07, data: [rate]);
+// ★ FIXED: correct one‑byte payload as per spec – no userId argument
+/* ───── review / memory mode ─────
+ * two-byte payload:  [2 /*target-state*/, userId]             */
+BP2Frame switchToMemory()   => BP2Frame(cmd: 0x09, data: const [2]);
 
-/* ───────── HISTORY / FILE OPS ───────── */
+BP2Frame getFileList()      => BP2Frame(cmd: 0xF1);
 
-/* ▶ NEW: review-mode entry with optional user-id
- *   Payload = [2 /*target_status*/, userId]                  */
-BP2Frame switchToMemory({int userId = 0}) =>
-    BP2Frame(cmd: 0x09, data: [2, userId & 0xFF]);
+// Delete every file in Review / Memory mode (no payload == “all”)
+BP2Frame deleteAllFiles() => BP2Frame(cmd: 0xF8);
 
-
-
-BP2Frame getFileList() => BP2Frame(cmd: 0xF1);
-
-/* ▶ start read: 16-byte filename + uint32 offset */
-BP2Frame readFileStart(String name, int offset) {
+BP2Frame readFileStart(String n, int off) {
   final d = Uint8List(20)..fillRange(0, 20, 0);
-  final bytes = ascii.encode(name.padRight(16, '\x00'));
-  d.setRange(0, 16, bytes);
-  ByteData.view(d.buffer).setUint32(16, offset, Endian.little);
+  d.setRange(0, 16, ascii.encode(n.padRight(16, '\x00')));
+  ByteData.view(d.buffer).setUint32(16, off, Endian.little);
   return BP2Frame(cmd: 0xF2, data: d);
 }
 
-/* ▶ data chunk: uint32 offset + uint16 length */
-BP2Frame readFileData(int offset, int length) {
+BP2Frame readFileData(int off, int len) {
   final d = Uint8List(6);
   ByteData.view(d.buffer)
-    ..setUint32(0, offset, Endian.little)
-    ..setUint16(4, length, Endian.little);
+    ..setUint32(0, off, Endian.little)
+    ..setUint16(4, len, Endian.little);
   return BP2Frame(cmd: 0xF3, data: d);
 }
 
-BP2Frame readFileEnd() => BP2Frame(cmd: 0xF4);
+BP2Frame readFileEnd()      => BP2Frame(cmd: 0xF4);
 
-/* ───────── ECG helpers ───────── */
+List<double> decodeEcg(List<int> b) => [for (var i = 0; i+1 < b.length; i+=2)
+  (b[i] | (b[i+1] << 8)).toSigned(16) * 0.003098];
 
-List<double> decodeEcg(List<int> bytes) {
-  final out = <double>[];
-  for (var i = 0; i + 1 < bytes.length; i += 2) {
-    final n = (bytes[i] | (bytes[i + 1] << 8)).toSigned(16);
-    out.add(n * 0.003098);            // mV
-  }
-  return out;
-}
-
+// legacy BP helper
 BP2Frame readFile(int id, int off) =>
-    BP2Frame(cmd: 0xF2, pkgType: 0, pkgNo: 0, data: [id, off & 0xFF, off >> 8]);
-
+    BP2Frame(cmd: 0xF2, data: [id, off & 0xFF, off >> 8]);

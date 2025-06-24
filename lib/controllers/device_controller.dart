@@ -35,6 +35,7 @@ class DeviceController extends GetxController {
   final diagText       = ''.obs;
   final bpmNow         = 0.obs, sysNow = 0.obs, diaNow = 0.obs;
   final ecg            = <FlSpot>[].obs;
+  bool get isRunning => _ecgRunning;
 
   /* Y-axis */
   final yScale = 2.0.obs;                                  // 2 / 1 / 0.5 mV div⁻¹
@@ -60,7 +61,7 @@ class DeviceController extends GetxController {
   Timer? _poll;
   StreamSubscription? _bleSub;
   bool _busy               = false;                       // poller debounce flag
-
+  bool _ecgRunning = false;                // <─ NEW
   /* ───────── lifecycle ───────── */
   @override
   void onInit() {
@@ -97,6 +98,7 @@ class DeviceController extends GetxController {
     await _send(echo());
     await _send(getDeviceInfo());
     await _send(getBattery());
+    await _send(deleteAllFiles());   // clear history right after a successful connect
   }
 
   Future<void> disconnect() async {
@@ -154,29 +156,60 @@ class DeviceController extends GetxController {
     await _send(rtWrapper(25));
 
     // 4 │ loss-free poller
-    _poll?.cancel();
     _poll = Timer.periodic(const Duration(milliseconds: 40), (_) async {
       if (_busy) return;
       _busy = true;
       await _send(BP2Frame(cmd: 0x08));
     });
-
+    _ecgRunning = true;                  // ← moved down
     statusText.value = 'ECG-Measuring';
+  }
+// DeviceController
+  /// Make absolutely sure the device is NOT in realtime mode.
+  /// Safe to call even when no ECG is running.
+  /// Make absolutely sure the device is NOT in realtime mode.
+  /// Safe to call even if no ECG is currently running.
+  Future<void> stopRealtime() async {
+    // 1 ─ stop the poller no-matter-what
+    _poll?.cancel();
+    _poll = null;            // <-- avoid zombie timer
+    _busy = true;            // block new polls while we drain
+
+    // 2 ─ tell firmware to close both realtime channels
+    await _send(rtWave(0));      // CMD 0x07 wrapper
+    await _send(rtWrapper(0));   // CMD 0x08 waveform (ACK will bounce)
+
+    // 3 ─ wait until we have seen *at least one* 0x08 echo
+    //     and then 300 ms of complete silence
+    var last08 = DateTime.now();
+    final sub = _ble.frames.listen((f) {
+      if (f.cmd == 0x08) last08 = DateTime.now();
+    });
+
+    while (DateTime.now().difference(last08).inMilliseconds < 300) {
+      await Future.delayed(const Duration(milliseconds: 60));
+    }
+    await sub.cancel();
+
+    // 4 ─ reset state
+    _busy = false;
+    _ecgRunning = false;
+    statusText.value = 'Idle';
   }
 
   /* ═════════ ECG control ═════════ */
   Future<void> stopEcg() async {
+    if (!_ecgRunning) return;      // already stopping/running a sync
+    _ecgRunning = false;           // ← put it right here, first line
+
     _log('⇢ ECG stop');
 
     _poll?.cancel();
-    _busy = true;                       // block any stray poll tick
+    _busy = true;
 
-    // 1) turn off streams
-    await _send(rtWave(0));             // 0x07 00
-    await _send(rtWrapper(0));          // 0x08 00
-
+    await _send(rtWave(0));
+    await _send(rtWrapper(0));
     _maybePushToUi(force: true);
-
     // 2) wait until the device sends its *last* 0x08
     bool quiet = false;
     late final sub;
@@ -188,11 +221,10 @@ class DeviceController extends GetxController {
     sub.cancel();
 
     // 3) hand control to HistoryController
-    Get.find<HistoryController>().syncLatestEcg(userId: 0);
-
+    _ecgRunning = false;                   // <─ NEW
+    Get.find<HistoryController>().syncLatestEcg();
     statusText.value = 'Idle';
   }
-
 
 
   /* ═════════ dispatch ═════════ */
@@ -207,7 +239,17 @@ class DeviceController extends GetxController {
       case 0xE4: if (f.data.length>=2) _updBattery(f.data[1]); break;
       case 0x06:
         if (f.data.length>=3) _updBattery(f.data[2]);
+        if (f.data.isNotEmpty && f.data[0] == 1 /*Review*/) {
+          _poll?.cancel();             // <- make sure it stays off
+          _busy = false;
+        }
         if (f.data.isNotEmpty) statusText.value = _statusLabel(f.data[0]);
+        /* auto-stop when the device itself ends the ECG           */
+        if (f.data.isNotEmpty && f.data[0] == 7 && _ecgRunning) {
+          // RunStatus == 7  →  “ECG-End”
+          stopEcg();
+          return;
+        }
         break;
       case 0x07: _handleRtWave(f.data);             break;
       case 0x08: _handleRtData(f.data);             break;
@@ -288,6 +330,7 @@ class DeviceController extends GetxController {
   /* ═════════ utils ═════════ */
 
   Future<void> _send(BP2Frame f) async {
+    debugPrint('[DBG-TX] ${f.encode().map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
     if (_dbg) {
       _log('TX cmd=${f.cmd?.toRadixString(16)??'--'} '
           'type=${f.pkgType} no=${f.pkgNo} len=${f.data.length}');
