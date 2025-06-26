@@ -43,16 +43,17 @@ class HistoryController extends GetxController {
   static const int _sps         = 125;  // Hz
 
 // ── OFFSETS *inside* AnalysisResult_t (little-endian) ──
-  // ── OFFSETS inside AnalysisResult_t ──
-  static const int _tsOff       =  0;   // u32 start timestamp
-  static const int _maskOff     =  4;   // u32 analysisMask
-  static const int _durOff      = 10;   // u32 duration   ← NEW
-  static const int _hrOff       = 14;   // u16 HR         (bug-fix)
-  static const int _qrsOff      = 16;   // u16 QRS
-  static const int _pvcsOff     = 18;   // u16 PVCs
-  static const int _qtcOff      = 20;   // u16 QTc
+  static const int _tsOff   =  0;   // u32 start timestamp      (same)
+  static const int _maskOff =  4;   // u32 analysisMask*        (same – often 0xFFFF on 2025 fw)
+  static const int _durOff  = 10;   // u32 recording_time       (was  8)
+  static const int _hrOff   = 18;   // u16 HR   (NEW → +4)
+  static const int _qrsOff  = 20;   // u16 QRS  (NEW → +4)
+  static const int _pvcsOff = 22;   // u16 PVCs (NEW → +4)
+  static const int _qtcOff  = 24;   // u16 QTc  (NEW → +4)
 
 
+
+  bool _looksLikeHr(int v) => v > 20 && v < 250;      // sane HR range
 
   /* ───────── helpers ───────── */
 
@@ -300,50 +301,65 @@ class HistoryController extends GetxController {
 
 
 /* ───────── ECG file parser ───────── */
-/* ───────── ECG file parser ───────── */
+/* ───────── ECG file parser (v4.4) ───────── */
   void _parseEcgFile(Uint8List buf) {
-    if (buf.length < _waveOffset + 2) return;          // sanity
+    if (buf.length < 60) return;                        // short-file guard
 
     final bd = ByteData.sublistView(buf);
-    if (bd.getUint8(1) != 2) return;                  // not an ECG file
+    if (bd.getUint8(1) != 2) return;                    // not an ECG payload
 
-    // ─── basic header (10 bytes) ───
+    // ─── constants for the two known header sizes ───
+    const int _resultOld = 38;          // 2023 fw   → wave @ 10 + 38 = 48
+    const int _resultNew = 44;          // 2025 fw   → wave @ 10 + 42 = 52
 
-    // ─── analysis-result block (38 bytes) ───
-    // 10-byte header already skipped with _hdrBytes
-    final startSecs = bd.getUint32(_hdrBytes + _tsOff,  Endian.little);
-    final duration  = bd.getUint32(_hdrBytes + _durOff, Endian.little);
-    final mask      = bd.getUint32(_hdrBytes + _maskOff, Endian.little);
-    final hr        = bd.getUint16(_hdrBytes + _hrOff,  Endian.little);
-    final qrs       = bd.getUint16(_hdrBytes + _qrsOff, Endian.little);
-    final pvcs      = bd.getUint16(_hdrBytes + _pvcsOff, Endian.little);
-    final qtc       = bd.getUint16(_hdrBytes + _qtcOff, Endian.little);
+    /* --- 1.  try "new" layout first --------------------------------------- */
+    int duration = bd.getUint32(_hdrBytes + _durOff, Endian.little);
+    int hr       = bd.getUint16(_hdrBytes + _hrOff,  Endian.little);
+    bool useNew  = _looksLikeHr(hr) && duration != 0;
 
-    // final cable   = bd.getUint8 (_hdrBytes + _cableOff); // unused for now
+    /* --- 2.  if HR/duration look bogus, fall back to the old offsets ------ */
+    if (!useNew) {
+      duration = bd.getUint32(_hdrBytes +  8, Endian.little);   // old dur
+      hr       = bd.getUint16(_hdrBytes + 12, Endian.little);   // old HR
+    }
 
-    // ─── waveform ───
-    final wave = buf.sublist(_waveOffset);
+    // final offsets according to the chosen layout
+    final qrs  = bd.getUint16(_hdrBytes + (useNew ? _qrsOff  : 14), Endian.little);
+    final pvcs = bd.getUint16(_hdrBytes + (useNew ? _pvcsOff : 16), Endian.little);
+    final qtc  = bd.getUint16(_hdrBytes + (useNew ? _qtcOff  : 18), Endian.little);
+    final mask = bd.getUint32(_hdrBytes + _maskOff, Endian.little);
+    final startSecs = bd.getUint32(_hdrBytes + _tsOff, Endian.little);
+
+    // pick correct waveform offset
+    final waveOff = _hdrBytes + (useNew ? _resultNew : _resultOld);
+    if (buf.length <= waveOff + 2) return;              // corrupt
+
+    final wave = buf.sublist(waveOff);
     final secsFromWave = (wave.length ~/ 2) ~/ _sps;
 
-    if ((secsFromWave - duration).abs() > 1) {
-      print('[ECG] duration mismatch ($duration s vs $secsFromWave s) – skipped');
-      return;                                         // corrupt or old layout
+    // last-chance sanity: if header duration still looks fishy, trust the wave
+    if (duration == 0 || (secsFromWave - duration).abs() > 1) {
+      duration = secsFromWave;
     }
 
     final rec = EcgRecord(
-      start        : DateTime.fromMillisecondsSinceEpoch(startSecs * 1000, isUtc:true),
-      duration     : duration,
-      diagnosisBits: mask,
-      hr           : hr == 0xFFFF ? 0 : hr,           // filter bogus 65535
-      qrs          : qrs,
-      pvcs         : pvcs,
-      qtc          : qtc,
-      wave         : wave,
+      // store in **local** time so UI shows what you saw on the watch
+      start : DateTime.fromMillisecondsSinceEpoch(
+          startSecs * 1000, isUtc: true).toLocal(),
+
+      duration      : duration,
+      diagnosisBits : mask,
+      hr            : (hr == 0xFFFF) ? 0 : hr,
+      qrs           : qrs,
+      pvcs          : pvcs,
+      qtc           : qtc,
+      wave          : wave,
     );
 
     Hive.box<EcgRecord>('ecgBox').add(rec);
     ecgs.insert(0, rec);
   }
+
   /* ─── legacy BP handler (unchanged) ─── */
   void _onLegacyBpFrame(BP2Frame f) {/* … same as before … */}
 }

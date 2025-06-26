@@ -12,7 +12,9 @@ import 'dart:math' as math;
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/foundation.dart';
 import 'package:get/get.dart';
+import 'package:hive/hive.dart';
 
+import '../models/bp_record.dart';
 import '../models/device_info.dart';
 import '../services/ble_service.dart';
 import '../services/bp2_protocol.dart';
@@ -27,6 +29,26 @@ class DeviceController extends GetxController {
   final isScanning = false.obs;
   final isBleReady = false.obs;
   final devices    = [].obs;
+
+  /* ───── add UI observables ───── */
+  final pressureNow = 0.obs;     // cuff pressure (mmHg)
+  final meanNow     = 0.obs;
+  final pulseNow    = 0.obs;
+/* ───────── misc helpers ───────── */
+// ─── add near the other BP-specific constants ───
+  static const int BP_WAV_MEASURING = 0x01;
+  static const int BP_WAV_RESULT    = 0x02;
+
+// ─── BP / ECG realtime helpers ──────────────────────────────────────────────
+  static const int _wrapPollMs    = 200;   // official spec – one 0x08 every 200 ms
+  static const int _waveRateHz    = 25;    // 25 Hz = 250 sps (matches firmware)
+
+// mode flags
+  bool _ecgRunning = false;
+  bool _bpRunning  = false;
+
+
+
 
   /* ───────── UI bindables ───────── */
   final info           = Rx<DeviceInfo?>(null);
@@ -61,7 +83,6 @@ class DeviceController extends GetxController {
   Timer? _poll;
   StreamSubscription? _bleSub;
   bool _busy               = false;                       // poller debounce flag
-  bool _ecgRunning = false;                // <─ NEW
   /* ───────── lifecycle ───────── */
   @override
   void onInit() {
@@ -106,15 +127,52 @@ class DeviceController extends GetxController {
     await _ble.disconnect();
     isBleReady.value = false;
   }
-
-  /* ═════════ BP (unchanged) ═════════ */
-  Future<void> startBp({int rate = 10}) async {
-    await _send(switchToBp());
-    await Future.delayed(const Duration(milliseconds: 300));
-    await _send(startBpTest());
-    await Future.delayed(const Duration(milliseconds: 500));
-    await _send(rtWave(rate.clamp(1, 25)));
+  /// Re-usable poller: starts a timer that sends CMD 0x08 at the spec’d interval
+  Future<void> _startWrapperPoll() async {
+    _poll?.cancel();               // safety – never two pollers at once
+    _poll = Timer.periodic(Duration(milliseconds: _wrapPollMs), (_) async {
+      if (_busy) return;
+      _busy = true;
+      await _send(BP2Frame(cmd: 0x08));
+    });
   }
+  /* ═════════ BP (unchanged) ═════════ */
+  /// Begin a BP measurement with Viatom-recommended 200 ms polling.
+  Future<void> startBp({
+    int targetPressure = 150,      // mmHg, tweak for paediatric / hypertensive users
+    int rate          = 10         // waveform rate in Hz (1-25)
+  }) async {
+    statusText.value  = 'BP-Prep';
+    pulseNow.value    = 0;
+    pressureNow.value = 0;
+    sysNow.value      = 0;
+    diaNow.value      = 0;
+    meanNow.value     = 0;
+
+    // 1 — switch the firmware into BP mode
+    await _send(switchToBp());
+    await Future.delayed(const Duration(milliseconds: 200));
+
+    // 2 — start the test with a reasonable target pressure
+    await _send(startBpTest(targetPressure));
+
+    // 3 — open both realtime channels
+    final r = rate.clamp(1, 25);
+    await _send(rtWave(r));        // CMD 0x07
+    await _send(rtWrapper(r));     // CMD 0x08 _setup_
+
+    // 4 — poll 0x08 every 200 ms for loss-free realtime packets
+    _poll?.cancel();
+    _poll = Timer.periodic(const Duration(milliseconds: 200), (_) async {
+      if (_busy) return;
+      _busy = true;
+      await _send(BP2Frame(cmd: 0x08));   // actual poll
+    });
+
+    statusText.value = 'BP-Measuring';
+  }
+
+
 
   /* ═════════ ECG control ═════════ */
   Future<void> startEcg() async {
@@ -293,11 +351,46 @@ class DeviceController extends GetxController {
     _handleRtWave(d.sublist(9));               // strip RunStatus
   }
 
-  void _handleRtWave(List<int> d) {
-    if (d.length<25) return;
-    final cnt = d[21] | (d[22]<<8);
-    final end = 23 + cnt*2;
-    if (end> d.length) return;
+// ───────── _handleRtWave – complete, updated version ─────────
+  /// Parses both ECG and BP realtime packets.
+  void _handleRtWave(List<int> d) async {                 // ← async!
+    if (d.isEmpty) return;
+
+    const BP_WAV_MEASURING = 0x02;
+    const BP_WAV_RESULT    = 0x03;
+
+    if (d[0] == BP_WAV_MEASURING && d.length >= 25) {
+      pressureNow.value = _i16(d, 2);          // cuff pressure (mmHg)
+      pulseNow.value    = _i16(d, 4 + 1);      // pulse/min
+      // fall through to waveform ≤
+    }
+    else if (d[0] == BP_WAV_RESULT && d.length >= 25) {
+      sysNow.value   = _i16(d, 2 + 1);
+      diaNow.value   = _i16(d, 4 + 1);
+      meanNow.value  = _i16(d, 6 + 1);
+      pulseNow.value = _i16(d, 8 + 1);
+      pressureNow.value = 0;
+      statusText.value  = 'BP-Done';
+
+      // ➜ store in Hive + refresh History
+      final rec = BpRecord(
+        systolic : sysNow.value,
+        diastolic: diaNow.value,
+        mean     : meanNow.value,
+        pulse    : pulseNow.value,
+        time     : DateTime.now(),
+      );
+      await Hive.box<BpRecord>('bpBox').add(rec);           // no more error
+      Get.find<HistoryController>().records.insert(0, rec);
+      _poll?.cancel();                     // <— NEW
+      _busy = false;
+    }
+
+    // ── common waveform decoder ──
+    if (d.length < 25) return;
+    final cnt = d[21] | (d[22] << 8);
+    final end = 23 + cnt * 2;
+    if (end > d.length) return;
     _consumeSampleBytes(d.sublist(23, end));
   }
 
@@ -338,13 +431,40 @@ class DeviceController extends GetxController {
     await _ble.sendFrame(f);
   }
 
+  /// Called by the "Pull BP" button to make sure the latest result is stored.
+  /// If a result is already in History this is a no-op.
+  void storeLastBpResult() {
+    if (sysNow.value == 0) return; // nothing to save
+    final already = Get.find<HistoryController>()
+        .records
+        .firstWhereOrNull((r) => r.time.difference(DateTime.now()).inSeconds.abs() < 3);
+    if (already != null) return;   // saved a moment ago
+
+    final rec = BpRecord(
+      systolic : sysNow.value,
+      diastolic: diaNow.value,
+      mean     : meanNow.value,
+      pulse    : pulseNow.value,
+      time     : DateTime.now(),
+    );
+    Hive.box<BpRecord>('bpBox').add(rec);
+    Get.find<HistoryController>().records.insert(0, rec);
+  }
+
+
   void _updBattery(int pct){
     if(pct==batteryPercent.value) return;
     batteryPercent.value = pct;
     _log('⚡ battery $pct %');
   }
 
-  int _u16(List<int> b,int o)=>b[o]|(b[o+1]<<8);
+  /* ─── tiny util ─── */
+  int _u16(List<int> b, int o) => b[o] | (b[o + 1] << 8);
+
+  int _i16(List<int> b, int o) =>
+      (b[o] | (b[o + 1] << 8)).toSigned(16);
+
+
 
   String _statusLabel(int c)=>[
     'Sleep','Review','Charge','Ready',

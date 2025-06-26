@@ -1,9 +1,7 @@
-// live_page.dart – Release 21 Jun 2025
-//
-//  • Wrap-layout prevents overflow on small screens.
-//  • ECG chart sits in an InteractiveViewer so you can pan/zoom after a run.
-//  • Logical width grows with recording length (≤60 s history).
-
+/*──────────────────────────────────────────────────────────────────────────────
+  live_page.dart – BP + ECG live monitor
+  28 Jun 2025
+──────────────────────────────────────────────────────────────────────────────*/
 import 'dart:math' as math;
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
@@ -17,13 +15,14 @@ class LivePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final c = Get.find<DeviceController>();
+    final c  = Get.find<DeviceController>();
+    final hc = Get.find<HistoryController>();   // for pull buttons
 
     return Scaffold(
       appBar: AppBar(title: const Text('Live monitor')),
       body: Obx(() => Column(
         children: [
-          /* ───── battery & status ───── */
+          /* ───── battery & connection status ───── */
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Row(children: [
@@ -32,42 +31,50 @@ class LivePage extends StatelessWidget {
               Text('${c.batteryPercent.value}%'),
               const Spacer(),
               Flexible(
-                  child:
-                  Text(c.statusText.value, textAlign: TextAlign.end)),
+                child: Text(c.statusText.value,
+                    textAlign: TextAlign.end),
+              ),
             ]),
           ),
 
-          /* ───── controls (no overflow) ───── */
+          /* ───── control buttons ───── */
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
-            child:Wrap(
+            child: Wrap(
               spacing: 8,
               runSpacing: 4,
               children: [
-                // Start ECG, Start BP, Stop …
+                /* ECG */
                 ElevatedButton.icon(
                   icon: const Icon(Icons.favorite),
                   label: const Text('Start ECG'),
                   onPressed: c.startEcg,
                 ),
+                /* BP */
                 ElevatedButton.icon(
                   icon: const Icon(Icons.bloodtype),
                   label: const Text('Start BP'),
-                  onPressed: c.startBp,
+                  onPressed: () => c.startBp(),   // pass custom target if you wish
                 ),
+                /* STOP (closes realtime) */
                 ElevatedButton.icon(
                   icon: const Icon(Icons.stop_circle),
-                  label: const Text('Stop'),
+                  label: const Text('Stop BP/ECG'),
                   onPressed: c.stopEcg,
                 ),
-                /* NEW ↓ */
+
+                /* pull/save buttons */
                 ElevatedButton.icon(
                   icon: const Icon(Icons.download),
                   label: const Text('Pull ECG'),
-                  onPressed: () =>
-                      Get.find<HistoryController>().syncLatestEcg(),
+                  onPressed: () => hc.syncLatestEcg(),
                 ),
-                /* existing speed-toggle button */
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.download_for_offline),
+                  label: const Text('Pull BP'),
+                  onPressed: () => Get.find<HistoryController>().syncLatestBp(),
+                ),
+                /* speed toggle */
                 Obx(() => ElevatedButton.icon(
                   icon: const Icon(Icons.speed),
                   label: Text('${c.speedLbl} mm/s'),
@@ -75,25 +82,33 @@ class LivePage extends StatelessWidget {
                 )),
               ],
             ),
-
           ),
           const SizedBox(height: 6),
 
           /* ───── read-outs ───── */
-          Obx(() => Text(
-            c.bpmNow.value == 0
-                ? 'Contact electrodes…'
-                : 'BP ${c.sysNow.value}/${c.diaNow.value}  •  HR ${c.bpmNow.value}',
-            style: const TextStyle(fontSize: 16),
-          )),
-          Obx(() => Padding(
-            padding: const EdgeInsets.only(top: 4),
-            child: Text('${c.yScale.value.toStringAsFixed(1)} mV/div',
-                style:
-                const TextStyle(fontSize: 12, color: Colors.grey)),
-          )),
+          Obx(() => Column(children: [
+            /* cuff pressure while running BP */
+            if (c.statusText.value.startsWith('BP'))
+              Text('Cuff ${c.pressureNow.value} mmHg',
+                  style: const TextStyle(fontSize: 14)),
+            const SizedBox(height: 2),
+            /* results */
+            Text(
+              c.sysNow.value == 0
+                  ? 'HR ${c.bpmNow.value == 0 ? '--' : c.bpmNow.value}'
+                  : '${c.sysNow.value}/${c.diaNow.value}  '
+                  'MAP ${c.meanNow.value}  '
+                  'HR ${c.pulseNow.value}',
+              style: const TextStyle(fontSize: 16),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              '${c.yScale.value.toStringAsFixed(1)} mV/div',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ])),
 
-          /* ───── ECG chart ───── */
+          /* ───── ECG / oscillogram chart ───── */
           Expanded(
             child: Obx(() {
               final spots = c.ecg;
@@ -101,13 +116,11 @@ class LivePage extends StatelessWidget {
                 return const Center(child: Text('Waiting for data…'));
               }
 
-              // chart logical width grows with recording (max 60 s)
-              const pxPerSec = 75.0;
+              const pxPerSec = 75.0;            // logical width scale
               final totalSec = math.max(spots.last.x, c.windowSec);
               final chartW   = totalSec * pxPerSec;
-
-              final lastX = spots.last.x;
-              final window = c.windowSec;
+              final lastX    = spots.last.x;
+              final window   = c.windowSec;
 
               return InteractiveViewer(
                 minScale: 1,
@@ -125,7 +138,7 @@ class LivePage extends StatelessWidget {
                           minX: lastX - window,
                           maxX: lastX,
                           minY: -c.yScale.value,
-                          maxY: c.yScale.value,
+                          maxY:  c.yScale.value,
                           titlesData: FlTitlesData(
                             leftTitles: AxisTitles(
                               sideTitles: SideTitles(
@@ -133,9 +146,9 @@ class LivePage extends StatelessWidget {
                                 showTitles: true,
                                 interval: c.yScale.value / 2,
                                 getTitlesWidget: (v, _) => Text(
-                                    v.toStringAsFixed(1),
-                                    style:
-                                    const TextStyle(fontSize: 10)),
+                                  v.toStringAsFixed(1),
+                                  style: const TextStyle(fontSize: 10),
+                                ),
                               ),
                             ),
                             rightTitles: const AxisTitles(

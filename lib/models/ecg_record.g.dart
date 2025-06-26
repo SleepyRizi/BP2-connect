@@ -21,10 +21,10 @@ class EcgRecordAdapter extends TypeAdapter<EcgRecord> {
       duration: fields[1] as int,
       hr: fields[2] as int,
       diagnosisBits: fields[3] as int,
-      qrs: fields[4] as int,
-      pvcs: fields[5] as int,
-      qtc: fields[6] as int,
-      wave: (fields[7] as List).cast<int>(),
+      wave: fields[4] as Uint8List,
+      qrs: fields[5] as int,
+      pvcs: fields[6] as int,
+      qtc: fields[7] as int,
     );
   }
 
@@ -41,13 +41,13 @@ class EcgRecordAdapter extends TypeAdapter<EcgRecord> {
       ..writeByte(3)
       ..write(obj.diagnosisBits)
       ..writeByte(4)
-      ..write(obj.qrs)
+      ..write(obj.wave)
       ..writeByte(5)
-      ..write(obj.pvcs)
+      ..write(obj.qrs)
       ..writeByte(6)
-      ..write(obj.qtc)
+      ..write(obj.pvcs)
       ..writeByte(7)
-      ..write(obj.wave);
+      ..write(obj.qtc);
   }
 
   @override

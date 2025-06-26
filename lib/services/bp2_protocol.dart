@@ -80,7 +80,7 @@ BP2Frame getBattery()       => BP2Frame(cmd: 0xE4);
 
 BP2Frame switchToEcg()      => BP2Frame(cmd: 0x09, data: [1]);
 BP2Frame switchToBp()       => BP2Frame(cmd: 0x09, data: [0]);
-BP2Frame startBpTest()      => BP2Frame(cmd: 0x0A, data: [0xAA, 0x00]);
+// BP2Frame startBpTest()      => BP2Frame(cmd: 0x0A, data: [0xAA, 0x00]);
 
 BP2Frame rtWrapper(int r)   => BP2Frame(cmd: 0x08, data: [r]);
 BP2Frame rtWave   (int r)   => BP2Frame(cmd: 0x07, data: [r]);
@@ -118,3 +118,19 @@ List<double> decodeEcg(List<int> b) => [for (var i = 0; i+1 < b.length; i+=2)
 // legacy BP helper
 BP2Frame readFile(int id, int off) =>
     BP2Frame(cmd: 0xF2, data: [id, off & 0xFF, off >> 8]);
+
+// ─── BP commands ───
+// ─── BP commands ───
+BP2Frame enterBpMode()          => BP2Frame(cmd: 0x09, data: [0]);     // target_status = 0
+// 150 mmHg is what the official app uses on my unit – adapt if you want
+BP2Frame startBpTest([int tgt = 150 /*mmHg*/]) =>
+    BP2Frame(cmd: 0x0A, data: [tgt & 0xFF, tgt >> 8]);
+              // target pressure
+
+/* ---------- BP realtime helpers ---------- */
+
+/// Real-time-wave packet types (first byte of rt_wav.data)
+const int BP_WAV_MEASURING = 0;   // cuff inflating / deflating
+const int BP_WAV_RESULT    = 1;   // final result frame
+
+int _i16(List<int> b, int o) => (b[o] | (b[o + 1] << 8)).toSigned(16);
